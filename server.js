@@ -46,9 +46,24 @@ db.serialize(() => {
   `);
 });
 
-// TON Connect setup
+// Custom storage implementation for TON Connect
+const customStorage = {
+  storage: {},
+  getItem(key) {
+    return this.storage[key] || null;
+  },
+  setItem(key, value) {
+    this.storage[key] = value;
+  },
+  removeItem(key) {
+    delete this.storage[key];
+  },
+};
+
+// TON Connect setup with custom storage
 const connector = new TonConnect({
   manifestUrl: process.env.TON_CONNECT_MANIFEST_URL, // Use environment variable
+  storage: customStorage, // Use custom storage
 });
 
 // Your TON wallet address to receive fees
