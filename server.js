@@ -1,4 +1,4 @@
-require('dotenv').config(); // Load environment variables
+require('dotenv').config();
 const express = require('express');
 const sqlite3 = require('sqlite3').verbose();
 const { TonConnect } = require('@tonconnect/sdk');
@@ -46,50 +46,22 @@ db.serialize(() => {
   `);
 });
 
-// Custom storage implementation for TON Connect
-const customStorage = {
-  storage: {},
-  getItem(key) {
-    return this.storage[key] || null;
-  },
-  setItem(key, value) {
-    this.storage[key] = value;
-  },
-  removeItem(key) {
-    delete this.storage[key];
-  },
-};
-
-// TON Connect setup with custom storage
+// TON Connect setup
 const connector = new TonConnect({
-  manifestUrl: process.env.TON_CONNECT_MANIFEST_URL, // Use environment variable
-  storage: customStorage, // Use custom storage
+  manifestUrl: process.env.TON_CONNECT_MANIFEST_URL,
 });
 
-// Your TON wallet address to receive fees
-const YOUR_WALLET_ADDRESS = process.env.YOUR_WALLET_ADDRESS; // Use environment variable
+// Endpoint to create content
+app.post('/create-content', async (req, res) => {
+  const { type, title, description, url, price, creatorId, groupId, txHash } = req.body;
 
-// Service fee (0.10 USDT)
-const SERVICE_FEE = 0.10;
+  // Verify the 0.75 USDT fee transaction
+  const tx = await connector.getTransaction(txHash);
+  if (!tx || tx.amount < 0.75 * 1e6) {
+    return res.status(400).json({ error: 'Invalid fee payment' });
+  }
 
-// Endpoint for creators to connect their wallet
-app.post('/connect-wallet', (req, res) => {
-  const { creatorId, walletAddress } = req.body;
-  db.run(
-    'INSERT OR REPLACE INTO creators (id, walletAddress) VALUES (?, ?)',
-    [creatorId, walletAddress],
-    (err) => {
-      if (err) return res.status(500).json({ error: 'Database error' });
-      res.json({ success: true });
-    }
-  );
-});
-
-// Endpoint for creators to add paywalled content
-app.post('/create-content', (req, res) => {
-  const { type, title, description, url, price, creatorId, groupId } = req.body;
-
-  // Generate a unique content ID based on group ID and timestamp
+  // Generate a unique content ID
   const contentId = `${groupId}-${Date.now()}`;
 
   db.run(
@@ -102,7 +74,19 @@ app.post('/create-content', (req, res) => {
   );
 });
 
-// Endpoint for users to pay for content
+// Endpoint to fetch content
+app.get('/content/:groupId', (req, res) => {
+  const { groupId } = req.params;
+
+  db.all('SELECT * FROM content WHERE groupId = ?', [groupId], (err, content) => {
+    if (err || !content) {
+      return res.status(404).json({ error: 'Content not found' });
+    }
+    res.json({ content });
+  });
+});
+
+// Endpoint to pay for content
 app.post('/pay-for-content', async (req, res) => {
   const { contentId, userId, txHash } = req.body;
 
@@ -112,53 +96,22 @@ app.post('/pay-for-content', async (req, res) => {
       return res.status(404).json({ error: 'Content not found' });
     }
 
-    // Fetch creator's wallet address
-    db.get('SELECT * FROM creators WHERE id = ?', [content.creatorId], async (err, creator) => {
-      if (err || !creator) {
-        return res.status(404).json({ error: 'Creator not found' });
-      }
-
-      // Verify the transaction on the TON blockchain
-      const tx = await connector.getTransaction(txHash);
-      if (!tx || tx.amount < (content.price + SERVICE_FEE) * 1e6) { // Convert to smallest units
-        return res.status(400).json({ error: 'Invalid payment' });
-      }
-
-      // Save payment record
-      const creatorEarnings = content.price;
-      db.run(
-        'INSERT INTO payments (contentId, userId, txHash, amount, serviceFee, creatorEarnings) VALUES (?, ?, ?, ?, ?, ?)',
-        [contentId, userId, txHash, content.price, SERVICE_FEE, creatorEarnings],
-        (err) => {
-          if (err) return res.status(500).json({ error: 'Database error' });
-          res.json({ success: true });
-        }
-      );
-    });
-  });
-});
-
-// Endpoint to fetch content (only for paid users)
-app.get('/content/:groupId', (req, res) => {
-  const { groupId } = req.params;
-  const { userId } = req.query;
-
-  db.get(
-    'SELECT * FROM payments WHERE contentId LIKE ? AND userId = ?',
-    [`${groupId}-%`, userId],
-    (err, payment) => {
-      if (err || !payment) {
-        return res.status(403).json({ error: 'Payment required' });
-      }
-
-      db.get('SELECT * FROM content WHERE id = ?', [payment.contentId], (err, content) => {
-        if (err || !content) {
-          return res.status(404).json({ error: 'Content not found' });
-        }
-        res.json({ content });
-      });
+    // Verify the transaction
+    const tx = await connector.getTransaction(txHash);
+    if (!tx || tx.amount < (content.price + 0.10) * 1e6) {
+      return res.status(400).json({ error: 'Invalid payment' });
     }
-  );
+
+    // Save payment record
+    db.run(
+      'INSERT INTO payments (contentId, userId, txHash, amount, serviceFee, creatorEarnings) VALUES (?, ?, ?, ?, ?, ?)',
+      [contentId, userId, txHash, content.price, 0.10, content.price],
+      (err) => {
+        if (err) return res.status(500).json({ error: 'Database error' });
+        res.json({ success: true });
+      }
+    );
+  });
 });
 
 // Start the server
