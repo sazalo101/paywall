@@ -1,24 +1,50 @@
 require('dotenv').config(); // Load environment variables
 const express = require('express');
-const { Client } = require('pg'); // PostgreSQL client
+const sqlite3 = require('sqlite3').verbose();
 const { TonConnect } = require('@tonconnect/sdk');
 const cors = require('cors');
+const path = require('path');
 
 const app = express();
 app.use(express.json());
 app.use(cors());
 
-// PostgreSQL client setup
-const client = new Client({
-  connectionString: process.env.DATABASE_URL, // Use environment variable for database URL
-  ssl: {
-    rejectUnauthorized: false, // Required for Render's PostgreSQL
-  },
-});
+// SQLite database setup
+const dbPath = path.join(__dirname, 'database.sqlite');
+const db = new sqlite3.Database(dbPath);
 
-client.connect()
-  .then(() => console.log('Connected to PostgreSQL'))
-  .catch(err => console.error('Connection error', err.stack));
+db.serialize(() => {
+  db.run(`
+    CREATE TABLE IF NOT EXISTS creators (
+      id TEXT PRIMARY KEY,
+      walletAddress TEXT
+    )
+  `);
+  db.run(`
+    CREATE TABLE IF NOT EXISTS content (
+      id TEXT PRIMARY KEY,
+      type TEXT CHECK(type IN ('file', 'link', 'course')),
+      title TEXT,
+      description TEXT,
+      url TEXT,
+      price REAL,
+      creatorId TEXT,
+      groupId TEXT
+    )
+  `);
+  db.run(`
+    CREATE TABLE IF NOT EXISTS payments (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      contentId TEXT,
+      userId TEXT,
+      txHash TEXT,
+      amount REAL,
+      serviceFee REAL,
+      creatorEarnings REAL,
+      timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+    )
+  `);
+});
 
 // TON Connect setup
 const connector = new TonConnect({
@@ -34,8 +60,8 @@ const SERVICE_FEE = 0.10;
 // Endpoint for creators to connect their wallet
 app.post('/connect-wallet', (req, res) => {
   const { creatorId, walletAddress } = req.body;
-  client.query(
-    'INSERT INTO creators (id, walletAddress) VALUES ($1, $2) ON CONFLICT (id) DO UPDATE SET walletAddress = $2',
+  db.run(
+    'INSERT OR REPLACE INTO creators (id, walletAddress) VALUES (?, ?)',
     [creatorId, walletAddress],
     (err) => {
       if (err) return res.status(500).json({ error: 'Database error' });
@@ -51,8 +77,8 @@ app.post('/create-content', (req, res) => {
   // Generate a unique content ID based on group ID and timestamp
   const contentId = `${groupId}-${Date.now()}`;
 
-  client.query(
-    'INSERT INTO content (id, type, title, description, url, price, creatorId, groupId) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)',
+  db.run(
+    'INSERT INTO content (id, type, title, description, url, price, creatorId, groupId) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
     [contentId, type, title, description, url, price, creatorId, groupId],
     (err) => {
       if (err) return res.status(500).json({ error: 'Database error' });
@@ -66,18 +92,16 @@ app.post('/pay-for-content', async (req, res) => {
   const { contentId, userId, txHash } = req.body;
 
   // Fetch content details
-  client.query('SELECT * FROM content WHERE id = $1', [contentId], async (err, contentResult) => {
-    if (err || !contentResult.rows[0]) {
+  db.get('SELECT * FROM content WHERE id = ?', [contentId], async (err, content) => {
+    if (err || !content) {
       return res.status(404).json({ error: 'Content not found' });
     }
-    const content = contentResult.rows[0];
 
     // Fetch creator's wallet address
-    client.query('SELECT * FROM creators WHERE id = $1', [content.creatorId], async (err, creatorResult) => {
-      if (err || !creatorResult.rows[0]) {
+    db.get('SELECT * FROM creators WHERE id = ?', [content.creatorId], async (err, creator) => {
+      if (err || !creator) {
         return res.status(404).json({ error: 'Creator not found' });
       }
-      const creator = creatorResult.rows[0];
 
       // Verify the transaction on the TON blockchain
       const tx = await connector.getTransaction(txHash);
@@ -87,8 +111,8 @@ app.post('/pay-for-content', async (req, res) => {
 
       // Save payment record
       const creatorEarnings = content.price;
-      client.query(
-        'INSERT INTO payments (contentId, userId, txHash, amount, serviceFee, creatorEarnings) VALUES ($1, $2, $3, $4, $5, $6)',
+      db.run(
+        'INSERT INTO payments (contentId, userId, txHash, amount, serviceFee, creatorEarnings) VALUES (?, ?, ?, ?, ?, ?)',
         [contentId, userId, txHash, content.price, SERVICE_FEE, creatorEarnings],
         (err) => {
           if (err) return res.status(500).json({ error: 'Database error' });
@@ -104,20 +128,18 @@ app.get('/content/:groupId', (req, res) => {
   const { groupId } = req.params;
   const { userId } = req.query;
 
-  client.query(
-    'SELECT * FROM payments WHERE contentId LIKE $1 AND userId = $2',
+  db.get(
+    'SELECT * FROM payments WHERE contentId LIKE ? AND userId = ?',
     [`${groupId}-%`, userId],
-    (err, paymentResult) => {
-      if (err || !paymentResult.rows[0]) {
+    (err, payment) => {
+      if (err || !payment) {
         return res.status(403).json({ error: 'Payment required' });
       }
-      const payment = paymentResult.rows[0];
 
-      client.query('SELECT * FROM content WHERE id = $1', [payment.contentId], (err, contentResult) => {
-        if (err || !contentResult.rows[0]) {
+      db.get('SELECT * FROM content WHERE id = ?', [payment.contentId], (err, content) => {
+        if (err || !content) {
           return res.status(404).json({ error: 'Content not found' });
         }
-        const content = contentResult.rows[0];
         res.json({ content });
       });
     }
